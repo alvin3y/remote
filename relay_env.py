@@ -41,6 +41,8 @@ UPSTREAM_HOST = "api.openai.com"
 UPSTREAM_PORT = 18080
 UPSTREAM_PROXY_HOST = "proxy"
 UPSTREAM_PROXY_PORT = 8080
+RELAY_PROXY_HOST = "proxy"
+RELAY_PROXY_PORT = 8080
 PLACEHOLDER_AUTH = "Bearer sk-PLACEHOLDER_API_KEY"
 HOP_BY_HOP = {
     "connection",
@@ -278,7 +280,7 @@ class RelayClient:
         if split.query:
             path += "?" + split.query
         ssl_context = ssl.create_default_context() if split.scheme == "wss" else None
-        reader, writer = await asyncio.open_connection(host, port, ssl=ssl_context)
+        reader, writer = await self.connect_through_http_proxy(host, port, ssl_context)
         sock = writer.get_extra_info("socket")
         if sock is not None:
             set_tcp_nodelay(sock)
@@ -301,6 +303,33 @@ class RelayClient:
             line = await reader.readline()
             if line in {b"\r\n", b"\n", b""}:
                 break
+        return reader, writer
+
+    async def connect_through_http_proxy(
+        self,
+        host: str,
+        port: int,
+        ssl_context: ssl.SSLContext | None,
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        reader, writer = await asyncio.open_connection(RELAY_PROXY_HOST, RELAY_PROXY_PORT)
+        target = f"{host}:{port}"
+        headers = [
+            f"CONNECT {target} HTTP/1.1",
+            f"Host: {target}",
+        ]
+        writer.write(("\r\n".join(headers) + "\r\n\r\n").encode("ascii"))
+        await writer.drain()
+        status_line = await reader.readline()
+        parts = status_line.split(maxsplit=2)
+        if len(parts) < 2 or parts[1] != b"200":
+            rest = await reader.read()
+            raise ConnectionError((status_line + rest).decode("utf-8", "replace"))
+        while True:
+            line = await reader.readline()
+            if line in {b"\r\n", b"\n", b""}:
+                break
+        if ssl_context is not None:
+            await writer.start_tls(ssl_context, server_hostname=host)
         return reader, writer
 
     async def sender(self, writer: asyncio.StreamWriter) -> None:
