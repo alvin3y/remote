@@ -690,6 +690,41 @@ def complete_active_command(
     )
 
 
+def write_agent_message(thread_id: str, turn_id: str, text: str) -> None:
+    item_id = new_id("msg")
+    write_json(
+        {
+            "method": "item/started",
+            "params": {
+                "item": {"type": "agentMessage", "id": item_id, "text": ""},
+                "threadId": thread_id,
+                "turnId": turn_id,
+            },
+        }
+    )
+    write_json(
+        {
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "itemId": item_id,
+                "delta": text,
+            },
+        }
+    )
+    write_json(
+        {
+            "method": "item/completed",
+            "params": {
+                "item": {"type": "agentMessage", "id": item_id, "text": text},
+                "threadId": thread_id,
+                "turnId": turn_id,
+            },
+        }
+    )
+
+
 def write_turn_completed(thread_id: str, turn_id: str, started_at: int, start_ms: int) -> None:
     write_json(
         {
@@ -708,18 +743,15 @@ def write_turn_completed(thread_id: str, turn_id: str, started_at: int, start_ms
             },
         }
     )
-    write_json(
-        {
-            "method": "thread/status/changed",
-            "params": {
-                "threadId": thread_id,
-                "status": {"type": "idle"},
-            },
-        }
-    )
 
 
-def complete_turn(turn_state: ActiveTurnState, *, command_output: str = "", status: str = "completed") -> bool:
+def complete_turn(
+    turn_state: ActiveTurnState,
+    *,
+    command_output: str = "",
+    final_message: str = "",
+    status: str = "completed",
+) -> bool:
     with state_lock:
         if turn_state.completed:
             return False
@@ -731,6 +763,8 @@ def complete_turn(turn_state: ActiveTurnState, *, command_output: str = "", stat
             status="completed",
             exit_code=0,
         )
+        if final_message:
+            write_agent_message(turn_state.thread_id, turn_state.turn_id, final_message)
         write_turn_completed(turn_state.thread_id, turn_state.turn_id, turn_state.started_at, turn_state.start_ms)
         thread = threads.get(turn_state.thread_id)
         if thread:
@@ -753,7 +787,7 @@ def complete_turn_by_id(thread_id: str, turn_id: str, *, reason: str = "interrup
     return complete_turn(turn_state, command_output=output)
 
 
-def complete_active_turns(*, reason: str = "stopped") -> int:
+def complete_active_turns(*, reason: str = "stopped", final_message: str = "") -> int:
     with state_lock:
         turn_states = [
             turn_state
@@ -767,7 +801,7 @@ def complete_active_turns(*, reason: str = "stopped") -> int:
         output = ""
         if command_state and not command_state.completed:
             output = f"fake output from {command_state.command}, {reason} during cycle {command_state.cycle}\n"
-        if complete_turn(turn_state, command_output=output):
+        if complete_turn(turn_state, command_output=output, final_message=final_message):
             completed += 1
     return completed
 
@@ -801,7 +835,8 @@ def fake_command_loop(turn_state: ActiveTurnState) -> None:
         output = f"fake output from {command_state.command}, cycle {cycle}\n"
         write_command_completed(turn_state.thread_id, turn_state.turn_id, command_state, output)
         if cycle >= FINAL_COMMAND_CYCLE:
-            complete_turn(turn_state)
+            complete_turn(turn_state, final_message="COMPLETED")
+            shutdown_event.set()
             break
         cycle += 1
 
@@ -837,7 +872,7 @@ def handle_turn_interrupt(request_id: Any, params: dict[str, Any] | None) -> Non
 def handle_stop_request(request_id: Any, method: str | None) -> None:
     if not require_initialized(request_id):
         return
-    complete_active_turns(reason=str(method or "stopped").replace("/", " "))
+    complete_active_turns(reason=str(method or "stopped").replace("/", " "), final_message="COMPLETED")
     rpc_result(request_id, {})
     if method in {"shutdown", "exit", "server/stop", "app/stop", "stop"}:
         shutdown_event.set()
@@ -971,6 +1006,10 @@ def fake_codex_main() -> int:
     )
 
     while not shutdown_event.is_set():
+        if os.name == "posix":
+            readable, _, _ = select.select([sys.stdin], [], [], 0.1)
+            if not readable:
+                continue
         line = sys.stdin.readline()
         if line == "":
             break
@@ -996,7 +1035,7 @@ def fake_codex_main() -> int:
                 pass
             rpc_error(request_id, -32603, "Internal error")
 
-    complete_active_turns(reason="stdin closed")
+    complete_active_turns(reason="stdin closed", final_message="COMPLETED")
     shutdown_event.set()
     log_stderr("fake app-server stopped")
     return 0
@@ -2013,12 +2052,13 @@ class RelayClient:
             self.shell.terminate_all()
         except Exception:
             pass
-        complete_active_turns(reason=reason)
+        complete_active_turns(reason=reason, final_message="COMPLETED")
         await self.send({
             "type": "turnover",
             "worker_id": self.worker_id,
             "reason": reason,
         })
+        shutdown_event.set()
         await asyncio.sleep(0.15)
 
     def run_shell_exec_job(self, msg: dict[str, Any]) -> None:
