@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import contextlib
 import fcntl
 import http.client
 import json
@@ -323,16 +324,28 @@ def log_stderr(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
 
-def emit_turnover(reason: str, worker_id: str = "") -> None:
-    """Emit the Codex-library JSON-RPC turnover notification on stdout."""
-    write_json({
-        "method": "turnover",
-        "params": {
-            "reason": reason,
-            "worker_id": worker_id,
-            "createdAt": now_seconds(),
-        },
-    })
+@dataclass
+class ActiveCommandState:
+    item_id: str
+    process_id: str
+    command: str
+    cwd: str
+    cycle: int
+    started_ms: int
+    aggregated_output: str = ""
+    completed: bool = False
+
+
+@dataclass
+class ActiveTurnState:
+    thread_id: str
+    turn_id: str
+    cwd: str
+    stop_event: threading.Event
+    started_at: int
+    start_ms: int
+    completed: bool = False
+    current_command: ActiveCommandState | None = None
 
 
 @dataclass
@@ -342,6 +355,7 @@ class ThreadState:
     created_at: int
     subscribed: bool = True
     stop_events: list[threading.Event] = field(default_factory=list)
+    active_turns: dict[str, ActiveTurnState] = field(default_factory=dict)
 
 
 threads: dict[str, ThreadState] = {}
@@ -519,12 +533,21 @@ def handle_turn_start(request_id: Any, params: dict[str, Any] | None) -> None:
     )
 
     stop_event = threading.Event()
+    turn_state = ActiveTurnState(
+        thread_id=thread.thread_id,
+        turn_id=turn_id,
+        cwd=thread.cwd,
+        stop_event=stop_event,
+        started_at=turn_started_at,
+        start_ms=turn_start_ms,
+    )
     with state_lock:
         thread.stop_events.append(stop_event)
+        thread.active_turns[turn_id] = turn_state
 
     worker = threading.Thread(
         target=fake_command_loop,
-        args=(thread.thread_id, turn_id, thread.cwd, stop_event, turn_started_at, turn_start_ms),
+        args=(turn_state,),
         daemon=True,
     )
     worker.start()
@@ -537,11 +560,22 @@ def handle_turn_steer(request_id: Any, params: dict[str, Any] | None) -> None:
     rpc_result(request_id, {"turnId": turn_id})
     thread = get_or_create_thread((params or {}).get("threadId"))
     stop_event = threading.Event()
+    started_at = now_seconds()
+    start_ms = int(time.time() * 1000)
+    turn_state = ActiveTurnState(
+        thread_id=thread.thread_id,
+        turn_id=turn_id,
+        cwd=thread.cwd,
+        stop_event=stop_event,
+        started_at=started_at,
+        start_ms=start_ms,
+    )
     with state_lock:
         thread.stop_events.append(stop_event)
+        thread.active_turns[turn_id] = turn_state
     threading.Thread(
         target=fake_command_loop,
-        args=(thread.thread_id, turn_id, thread.cwd, stop_event, now_seconds(), int(time.time() * 1000)),
+        args=(turn_state,),
         daemon=True,
     ).start()
 
@@ -549,10 +583,7 @@ def handle_turn_steer(request_id: Any, params: dict[str, Any] | None) -> None:
 def write_command_started(
     thread_id: str,
     turn_id: str,
-    cwd: str,
-    item_id: str,
-    process_id: str,
-    command: str,
+    command_state: ActiveCommandState,
 ) -> None:
     write_json(
         {
@@ -560,13 +591,13 @@ def write_command_started(
             "params": {
                 "item": {
                     "type": "commandExecution",
-                    "id": item_id,
-                    "command": command,
-                    "cwd": cwd,
-                    "processId": process_id,
+                    "id": command_state.item_id,
+                    "command": command_state.command,
+                    "cwd": command_state.cwd,
+                    "processId": command_state.process_id,
                     "source": "unifiedExecStartup",
                     "status": "inProgress",
-                    "commandActions":[{"type": "unknown", "command": command}],
+                    "commandActions":[{"type": "unknown", "command": command_state.command}],
                     "aggregatedOutput": None,
                     "exitCode": None,
                     "durationMs": None,
@@ -581,35 +612,35 @@ def write_command_started(
 def write_command_completed(
     thread_id: str,
     turn_id: str,
-    cwd: str,
-    item_id: str,
-    process_id: str,
-    command: str,
-    cycle: int,
-    start_ms: int,
+    command_state: ActiveCommandState,
+    output: str,
+    *,
+    status: str = "completed",
+    exit_code: int | None = 0,
 ) -> None:
-    output = f"fake output from {command}, cycle {cycle}\n"
-    duration_ms = int(time.time() * 1000) - start_ms
+    duration_ms = int(time.time() * 1000) - command_state.started_ms
+    command_state.aggregated_output += output
 
-    write_json(
-        {
-            "method": "item/commandExecution/outputDelta",
-            "params": {
-                "threadId": thread_id,
-                "turnId": turn_id,
-                "itemId": item_id,
-                "delta": output,
-            },
-        }
-    )
+    if output:
+        write_json(
+            {
+                "method": "item/commandExecution/outputDelta",
+                "params": {
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "itemId": command_state.item_id,
+                    "delta": output,
+                },
+            }
+        )
     write_json(
         {
             "method": "item/commandExecution/terminalInteraction",
             "params": {
                 "threadId": thread_id,
                 "turnId": turn_id,
-                "itemId": item_id,
-                "processId": process_id,
+                "itemId": command_state.item_id,
+                "processId": command_state.process_id,
                 "stdin": "",
             },
         }
@@ -620,21 +651,42 @@ def write_command_completed(
             "params": {
                 "item": {
                     "type": "commandExecution",
-                    "id": item_id,
-                    "command": command,
-                    "cwd": cwd,
-                    "processId": process_id,
+                    "id": command_state.item_id,
+                    "command": command_state.command,
+                    "cwd": command_state.cwd,
+                    "processId": command_state.process_id,
                     "source": "unifiedExecStartup",
-                    "status": "completed",
-                    "commandActions":[{"type": "unknown", "command": command}],
-                    "aggregatedOutput": output,
-                    "exitCode": 0,
+                    "status": status,
+                    "commandActions":[{"type": "unknown", "command": command_state.command}],
+                    "aggregatedOutput": command_state.aggregated_output,
+                    "exitCode": exit_code,
                     "durationMs": duration_ms,
                 },
                 "threadId": thread_id,
                 "turnId": turn_id,
             },
         }
+    )
+    command_state.completed = True
+
+
+def complete_active_command(
+    turn_state: ActiveTurnState,
+    *,
+    output: str = "",
+    status: str = "completed",
+    exit_code: int | None = 0,
+) -> None:
+    command_state = turn_state.current_command
+    if not command_state or command_state.completed:
+        return
+    write_command_completed(
+        turn_state.thread_id,
+        turn_state.turn_id,
+        command_state,
+        output,
+        status=status,
+        exit_code=exit_code,
     )
 
 
@@ -667,47 +719,128 @@ def write_turn_completed(thread_id: str, turn_id: str, started_at: int, start_ms
     )
 
 
-def fake_command_loop(
-    thread_id: str,
-    turn_id: str,
-    cwd: str,
-    stop_event: threading.Event,
-    turn_started_at: int,
-    turn_start_ms: int,
-) -> None:
+def complete_turn(turn_state: ActiveTurnState, *, command_output: str = "", status: str = "completed") -> bool:
+    with state_lock:
+        if turn_state.completed:
+            return False
+        turn_state.completed = True
+        turn_state.stop_event.set()
+        complete_active_command(
+            turn_state,
+            output=command_output,
+            status="completed",
+            exit_code=0,
+        )
+        write_turn_completed(turn_state.thread_id, turn_state.turn_id, turn_state.started_at, turn_state.start_ms)
+        thread = threads.get(turn_state.thread_id)
+        if thread:
+            thread.active_turns.pop(turn_state.turn_id, None)
+            with contextlib.suppress(ValueError):
+                thread.stop_events.remove(turn_state.stop_event)
+        return True
+
+
+def complete_turn_by_id(thread_id: str, turn_id: str, *, reason: str = "interrupted") -> bool:
+    with state_lock:
+        thread = threads.get(thread_id)
+        turn_state = thread.active_turns.get(turn_id) if thread else None
+    if not turn_state:
+        return False
+    command_state = turn_state.current_command
+    output = ""
+    if command_state and not command_state.completed:
+        output = f"fake output from {command_state.command}, {reason} during cycle {command_state.cycle}\n"
+    return complete_turn(turn_state, command_output=output)
+
+
+def complete_active_turns(*, reason: str = "stopped") -> int:
+    with state_lock:
+        turn_states = [
+            turn_state
+            for thread in threads.values()
+            for turn_state in thread.active_turns.values()
+            if not turn_state.completed
+        ]
+    completed = 0
+    for turn_state in turn_states:
+        command_state = turn_state.current_command
+        output = ""
+        if command_state and not command_state.completed:
+            output = f"fake output from {command_state.command}, {reason} during cycle {command_state.cycle}\n"
+        if complete_turn(turn_state, command_output=output):
+            completed += 1
+    return completed
+
+
+def fake_command_loop(turn_state: ActiveTurnState) -> None:
     cycle = 1
-    while not shutdown_event.is_set() and not stop_event.is_set():
-        item_id = new_id("call")
-        process_id = str(uuid.uuid4().int % 100000)
-        command = FAKE_COMMAND
-        start_ms = int(time.time() * 1000)
+    while not shutdown_event.is_set() and not turn_state.stop_event.is_set():
+        command_state = ActiveCommandState(
+            item_id=new_id("call"),
+            process_id=str(uuid.uuid4().int % 100000),
+            command=FAKE_COMMAND,
+            cwd=turn_state.cwd,
+            cycle=cycle,
+            started_ms=int(time.time() * 1000),
+        )
+        with state_lock:
+            if turn_state.completed:
+                break
+            turn_state.current_command = command_state
 
-        write_command_started(thread_id, turn_id, cwd, item_id, process_id, command)
+        write_command_started(turn_state.thread_id, turn_state.turn_id, command_state)
 
-        if cycle not in IMMEDIATE_COMPLETION_CYCLES and stop_event.wait(DELAY_SECONDS):
+        if cycle not in IMMEDIATE_COMPLETION_CYCLES and turn_state.stop_event.wait(DELAY_SECONDS):
             break
+        if shutdown_event.is_set():
+            break
+        with state_lock:
+            if turn_state.completed:
+                break
 
-        write_command_completed(thread_id, turn_id, cwd, item_id, process_id, command, cycle, start_ms)
+        output = f"fake output from {command_state.command}, cycle {cycle}\n"
+        write_command_completed(turn_state.thread_id, turn_state.turn_id, command_state, output)
         if cycle >= FINAL_COMMAND_CYCLE:
-            write_turn_completed(thread_id, turn_id, turn_started_at, turn_start_ms)
+            complete_turn(turn_state)
             break
         cycle += 1
 
 
-def handle_turn_interrupt(request_id: Any, _params: dict[str, Any] | None) -> None:
+def handle_turn_interrupt(request_id: Any, params: dict[str, Any] | None) -> None:
     if not require_initialized(request_id):
         return
-    # Interrupt still does not complete the turn; only the final command cycle does.
-    # It also intentionally does not stop the fake command loop.
     rpc_result(request_id, {})
+    params = params or {}
+    turn_id = str(params.get("turnId") or "")
+    thread_id = str(params.get("threadId") or "")
+    if turn_id:
+        if thread_id:
+            complete_turn_by_id(thread_id, turn_id, reason="interrupted")
+            return
+        with state_lock:
+            matches = [
+                turn_state
+                for thread in threads.values()
+                for turn_state in thread.active_turns.values()
+                if turn_state.turn_id == turn_id
+            ]
+        for turn_state in matches:
+            complete_turn(turn_state, command_output=(
+                f"fake output from {turn_state.current_command.command}, interrupted during cycle {turn_state.current_command.cycle}\n"
+                if turn_state.current_command and not turn_state.current_command.completed
+                else ""
+            ))
+        return
+    complete_active_turns(reason="interrupted")
 
 
-def handle_ignored_stop_request(request_id: Any) -> None:
+def handle_stop_request(request_id: Any, method: str | None) -> None:
     if not require_initialized(request_id):
         return
-    # Testing behavior: acknowledge stop/cancel/shutdown-style JSON-RPC requests
-    # without stopping the process or any active fake command loop.
+    complete_active_turns(reason=str(method or "stopped").replace("/", " "))
     rpc_result(request_id, {})
+    if method in {"shutdown", "exit", "server/stop", "app/stop", "stop"}:
+        shutdown_event.set()
 
 
 def handle_loaded_threads(request_id: Any) -> None:
@@ -813,7 +946,7 @@ def dispatch(message: dict[str, Any]) -> None:
         "turn/cancel",
         "cancel",
     }:
-        handle_ignored_stop_request(request_id)
+        handle_stop_request(request_id, method)
     elif method == "thread/unsubscribe":
         handle_thread_unsubscribe(request_id, params)
     elif method == "thread/loaded/list":
@@ -863,6 +996,7 @@ def fake_codex_main() -> int:
                 pass
             rpc_error(request_id, -32603, "Internal error")
 
+    complete_active_turns(reason="stdin closed")
     shutdown_event.set()
     log_stderr("fake app-server stopped")
     return 0
@@ -1879,7 +2013,6 @@ class RelayClient:
             self.shell.terminate_all()
         except Exception:
             pass
-        emit_turnover(reason, self.worker_id)
         await self.send({
             "type": "turnover",
             "worker_id": self.worker_id,
