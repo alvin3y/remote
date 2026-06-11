@@ -2013,6 +2013,7 @@ class RelayClient:
             self.shell.terminate_all()
         except Exception:
             pass
+        complete_active_turns(reason=reason)
         await self.send({
             "type": "turnover",
             "worker_id": self.worker_id,
